@@ -79,26 +79,14 @@ app.get('/current', async (req, res) => {
             }
         );
 
-        if (response.status === 204 || !response.data?.item) {
-            return res.json({ playing: false });
-        }
-
-        const item = response.data.item;
-
-        res.json({
-            playing: true,
-            song: {
-                name: item.name,
-                artist: item.artists.map((a) => a.name).join(', '),
-                album: item.album.name,
-                artwork: item.album.images[0]?.url,
-            },
-        });
+        // Forward raw data from Spotify
+        return res.status(response.status).json(response.data);
     } catch (err) {
-        console.error(err.message);
+        console.error(err.response?.data || err.message);
         res.status(500).json({ error: 'Failed to fetch current song' });
     }
 });
+
 
 // Start the server
 app.listen(PORT, () => {
