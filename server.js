@@ -5,77 +5,121 @@ const cors = require("cors");
 const querystring = require("querystring");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 
-// File where tokens are stored
+// File where tokens are stored (add to .gitignore!)
 const TOKEN_FILE = path.join(__dirname, "tokens.json");
 
-// Default tokens in memory
+// In-memory token storage
 let accessToken = "";
 let refreshToken = "";
 
-// Load tokens from disk
+// In-memory state store for CSRF protection & redirect URLs
+const stateStore = new Map();
+
+// Load tokens from disk on startup
 function loadTokens() {
   try {
-    const raw = fs.readFileSync(TOKEN_FILE);
+    const raw = fs.readFileSync(TOKEN_FILE, "utf-8");
     const tokens = JSON.parse(raw);
     accessToken = tokens.accessToken || "";
     refreshToken = tokens.refreshToken || "";
-    console.log("Tokens loaded from file.");
+    log("Tokens loaded from file.");
   } catch (e) {
-    console.log("No tokens file found, starting fresh.");
-    accessToken = "";
-    refreshToken = "";
+    log("No tokens file found, starting fresh.");
   }
 }
 
 // Save tokens to disk
 function saveTokens() {
-  fs.writeFileSync(
-    TOKEN_FILE,
-    JSON.stringify({ accessToken, refreshToken }, null, 2)
-  );
+  try {
+    fs.writeFileSync(
+      TOKEN_FILE,
+      JSON.stringify({ accessToken, refreshToken }, null, 2),
+      "utf-8"
+    );
+  } catch (e) {
+    log("Error saving tokens:", e.message);
+  }
 }
 
-// Load tokens on startup
-loadTokens();
+// Simple logger with timestamps
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+// Generate random string for state
+function generateState(length = 16) {
+  return crypto.randomBytes(length).toString("hex");
+}
 
 // Environment variables
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI;
+const { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI } = process.env;
 
-// Step 1: Redirect user to Spotify login
+if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
+  log(
+    "Error: Missing required environment variables CLIENT_ID, CLIENT_SECRET, or REDIRECT_URI"
+  );
+  process.exit(1);
+}
+
+loadTokens();
+
+/**
+ * Spotify Authorization URL
+ */
 app.get("/login", (req, res) => {
   const scope = "user-read-currently-playing user-read-playback-state";
-  const returnTo = req.query.returnTo;
+  const returnTo = req.query.returnTo || "";
+
+  const state = generateState();
+  // Save state and returnTo for validation on callback
+  stateStore.set(state, returnTo);
 
   const queryParams = querystring.stringify({
     response_type: "code",
     client_id: CLIENT_ID,
-    scope: scope,
+    scope,
     redirect_uri: REDIRECT_URI,
-    state: encodeURIComponent(returnTo || ""), // pass frontend URL safely
+    state,
   });
 
-  res.redirect(`https://accounts.spotify.com/authorize?${queryParams}`);
+  const authUrl = `https://accounts.spotify.com/authorize?${queryParams}`;
+  log("Redirecting to Spotify login:", authUrl);
+  res.redirect(authUrl);
 });
 
-// Step 2: Handle redirect from Spotify after login
+/**
+ * Spotify OAuth callback handler
+ */
 app.get("/callback", async (req, res) => {
-  const code = req.query.code || null;
-  const returnTo = decodeURIComponent(req.query.state || "");
+  const { code, state } = req.query;
+
+  if (!code || !state) {
+    return res.status(400).send("Missing code or state");
+  }
+
+  // Validate the state parameter to protect against CSRF
+  if (!stateStore.has(state)) {
+    return res.status(400).send("Invalid state");
+  }
+
+  // Retrieve the return URL and remove state from store
+  const returnTo = stateStore.get(state) || "/";
+  stateStore.delete(state);
 
   try {
-    const response = await axios.post(
+    // Exchange authorization code for access and refresh tokens
+    const tokenResponse = await axios.post(
       "https://accounts.spotify.com/api/token",
       querystring.stringify({
         grant_type: "authorization_code",
-        code: code,
+        code,
         redirect_uri: REDIRECT_URI,
       }),
       {
@@ -88,23 +132,48 @@ app.get("/callback", async (req, res) => {
       }
     );
 
-    accessToken = response.data.access_token;
-    refreshToken = response.data.refresh_token;
-
+    // Save tokens in memory and persist to file
+    accessToken = tokenResponse.data.access_token;
+    refreshToken = tokenResponse.data.refresh_token;
     saveTokens();
 
-    if (returnTo) {
-      return res.redirect(returnTo); // redirect back to your frontend
-    } else {
-      return res.send(`<h2>✅ Logged in! You can close this tab.</h2>`);
-    }
+    // Send a small page that:
+    // - posts a message to the opener window notifying success
+    // - closes the popup window automatically
+    // - fallback redirects if opener doesn't exist
+    return res.send(`
+      <html>
+        <body>
+          <script>
+            (function() {
+              const returnTo = ${JSON.stringify(returnTo)};
+              if (window.opener) {
+                window.opener.postMessage({ type: "SPOTIFY_LOGIN_SUCCESS", returnTo }, "*");
+                window.close();
+              } else {
+                window.location.href = returnTo;
+              }
+            })();
+          </script>
+          <p>Login successful! You can close this window.</p>
+        </body>
+      </html>
+    `);
   } catch (error) {
     console.error("Callback error:", error.response?.data || error.message);
-    res.status(500).send("Authentication failed");
+    return res.status(500).send("Authentication failed");
   }
 });
 
+/**
+ * Refresh Spotify access token using refresh token
+ */
 async function refreshAccessToken() {
+  if (!refreshToken) {
+    log("No refresh token available.");
+    return false;
+  }
+
   try {
     const response = await axios.post(
       "https://accounts.spotify.com/api/token",
@@ -123,11 +192,16 @@ async function refreshAccessToken() {
     );
 
     accessToken = response.data.access_token;
-    saveTokens(); // persist updated token
-    console.log("✅ Access token refreshed.");
+    // Spotify may not always return a new refresh token
+    if (response.data.refresh_token) {
+      refreshToken = response.data.refresh_token;
+    }
+
+    saveTokens();
+    log("✅ Access token refreshed.");
     return true;
   } catch (error) {
-    console.error(
+    log(
       "Failed to refresh access token:",
       error.response?.data || error.message
     );
@@ -135,55 +209,74 @@ async function refreshAccessToken() {
   }
 }
 
-// Step 3: Get currently playing song
+/**
+ * Helper to delay execution for ms milliseconds
+ */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Get currently playing track
+ */
 app.get("/current", async (req, res) => {
   if (!accessToken) {
     return res.status(401).json({ error: "User not authenticated" });
   }
 
-  try {
-    const response = await axios.get(
-      "https://api.spotify.com/v1/me/player/currently-playing",
-      {
-        headers: {
-          Authorization: "Bearer " + accessToken,
-        },
-      }
-    );
+  async function fetchCurrent() {
+    try {
+      const response = await axios.get(
+        "https://api.spotify.com/v1/me/player/currently-playing",
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
 
-    return res.status(response.status).json(response.data);
-  } catch (err) {
-    if (err.response?.status === 401 && refreshToken) {
-      console.log("⚠️ Access token expired, attempting refresh...");
-      const refreshed = await refreshAccessToken();
-      if (refreshed) {
-        try {
-          const retry = await axios.get(
-            "https://api.spotify.com/v1/me/player/currently-playing",
-            {
-              headers: {
-                Authorization: "Bearer " + accessToken,
-              },
-            }
-          );
-          return res.status(retry.status).json(retry.data);
-        } catch (e) {
-          console.error("Failed after refresh:", e.response?.data || e.message);
-          return res.status(500).json({ error: "Failed after token refresh" });
+      // Spotify returns 204 No Content if nothing is playing
+      if (response.status === 204) {
+        return res.json({
+          playing: false,
+          message: "No song currently playing",
+        });
+      }
+
+      return res.status(response.status).json(response.data);
+    } catch (err) {
+      if (err.response) {
+        const status = err.response.status;
+
+        if (status === 401 && refreshToken) {
+          log("⚠️ Access token expired, refreshing...");
+          const refreshed = await refreshAccessToken();
+          if (refreshed) {
+            return fetchCurrent(); // retry once
+          }
+          return res
+            .status(401)
+            .json({ error: "Unauthorized, token refresh failed" });
+        }
+
+        if (status === 429) {
+          const retryAfter = parseInt(err.response.headers["retry-after"]) || 1;
+          log(`Rate limited. Retrying after ${retryAfter} seconds...`);
+          await delay(retryAfter * 1000);
+          return fetchCurrent(); // retry after delay
         }
       }
-    }
 
-    console.error(
-      "Error fetching current song:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({ error: "Failed to fetch current song" });
+      log("Error fetching current song:", err.response?.data || err.message);
+      return res.status(500).json({ error: "Failed to fetch current song" });
+    }
   }
+
+  return fetchCurrent();
 });
 
 // Start the server
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-  console.log(`Login at http://localhost:${PORT}/login`);
+  log(`Server running at http://localhost:${PORT}`);
+  log(`Login endpoint: http://localhost:${PORT}/login`);
 });
