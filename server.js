@@ -52,12 +52,14 @@ const REDIRECT_URI = process.env.REDIRECT_URI;
 // Step 1: Redirect user to Spotify login
 app.get("/login", (req, res) => {
   const scope = "user-read-currently-playing user-read-playback-state";
+  const returnTo = req.query.returnTo;
 
   const queryParams = querystring.stringify({
     response_type: "code",
     client_id: CLIENT_ID,
     scope: scope,
     redirect_uri: REDIRECT_URI,
+    state: encodeURIComponent(returnTo || ""), // pass frontend URL safely
   });
 
   res.redirect(`https://accounts.spotify.com/authorize?${queryParams}`);
@@ -66,6 +68,7 @@ app.get("/login", (req, res) => {
 // Step 2: Handle redirect from Spotify after login
 app.get("/callback", async (req, res) => {
   const code = req.query.code || null;
+  const returnTo = decodeURIComponent(req.query.state || "");
 
   try {
     const response = await axios.post(
@@ -88,16 +91,19 @@ app.get("/callback", async (req, res) => {
     accessToken = response.data.access_token;
     refreshToken = response.data.refresh_token;
 
-    saveTokens(); // persist tokens to disk
+    saveTokens();
 
-    res.send(`<h2>✅ Logged in! You can close this tab.</h2>`);
+    if (returnTo) {
+      return res.redirect(returnTo); // redirect back to your frontend
+    } else {
+      return res.send(`<h2>✅ Logged in! You can close this tab.</h2>`);
+    }
   } catch (error) {
     console.error("Callback error:", error.response?.data || error.message);
     res.status(500).send("Authentication failed");
   }
 });
 
-// Refresh token logic
 async function refreshAccessToken() {
   try {
     const response = await axios.post(
