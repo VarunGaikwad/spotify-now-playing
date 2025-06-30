@@ -11,66 +11,39 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 
-// MongoDB setup
-const MONGODB_URI = `mongodb+srv://gaikwadvarun23:${
-  process.env.MONGODB_PASSWORD || ""
-}@spotify-cluster.ckcsftr.mongodb.net/?retryWrites=true&w=majority&appName=Spotify-Cluster`;
-if (!MONGODB_URI) {
-  console.error("Missing MONGODB_URI environment variable");
+// Spotify and MongoDB config
+const { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, MONGODB_PASSWORD } =
+  process.env;
+
+if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI || !MONGODB_PASSWORD) {
+  console.error("Missing required env variables.");
   process.exit(1);
 }
 
-const client = new MongoClient(MONGODB_URI);
-let tokensCollection;
+const MONGODB_URI = `mongodb+srv://gaikwadvarun23:${encodeURIComponent(
+  MONGODB_PASSWORD
+)}@spotify-cluster.ckcsftr.mongodb.net/?retryWrites=true&w=majority`;
 
-// In-memory token cache (updated on load/save)
+const client = new MongoClient(MONGODB_URI, {
+  tls: true,
+  useUnifiedTopology: true,
+});
+
+let tokensCollection;
 let accessToken = "";
 let refreshToken = "";
 
-// In-memory state store for CSRF protection & redirect URLs
-const stateStore = new Map();
-
-// Simple logger with timestamps
+// Simple logger
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-// Generate random string for state
+// Generate random string for state param
 function generateState(length = 16) {
   return crypto.randomBytes(length).toString("hex");
 }
 
-// Environment variables
-const { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI } = process.env;
-
-if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
-  log(
-    "Error: Missing required environment variables CLIENT_ID, CLIENT_SECRET, or REDIRECT_URI"
-  );
-  process.exit(1);
-}
-
-/**
- * Load tokens from MongoDB
- */
-async function loadTokens() {
-  try {
-    const doc = await tokensCollection.findOne({ _id: "user_tokens" });
-    if (doc) {
-      accessToken = doc.accessToken || "";
-      refreshToken = doc.refreshToken || "";
-      log("Tokens loaded from MongoDB.");
-    } else {
-      log("No tokens found in MongoDB, starting fresh.");
-    }
-  } catch (e) {
-    log("Error loading tokens from MongoDB:", e.message);
-  }
-}
-
-/**
- * Save tokens to MongoDB
- */
+// Save tokens to MongoDB
 async function saveTokens() {
   try {
     await tokensCollection.updateOne(
@@ -80,104 +53,27 @@ async function saveTokens() {
     );
     log("Tokens saved to MongoDB.");
   } catch (e) {
-    log("Error saving tokens to MongoDB:", e.message);
+    log("Error saving tokens:", e.message);
   }
 }
 
-/**
- * Spotify Authorization URL endpoint
- */
-app.get("/login", (req, res) => {
-  const scope = "user-read-currently-playing user-read-playback-state";
-  const returnTo = req.query.returnTo || "";
-
-  const state = generateState();
-  // Save state and returnTo for validation on callback
-  stateStore.set(state, returnTo);
-
-  const queryParams = querystring.stringify({
-    response_type: "code",
-    client_id: CLIENT_ID,
-    scope,
-    redirect_uri: REDIRECT_URI,
-    state,
-  });
-
-  const authUrl = `https://accounts.spotify.com/authorize?${queryParams}`;
-  log("Redirecting to Spotify login:", authUrl);
-  res.redirect(authUrl);
-});
-
-/**
- * Spotify OAuth callback handler
- */
-app.get("/callback", async (req, res) => {
-  const { code, state } = req.query;
-
-  if (!code || !state) {
-    return res.status(400).send("Missing code or state");
-  }
-
-  // Validate the state parameter to protect against CSRF
-  if (!stateStore.has(state)) {
-    return res.status(400).send("Invalid state");
-  }
-
-  // Retrieve the return URL and remove state from store
-  const returnTo = stateStore.get(state) || "/";
-  stateStore.delete(state);
-
+// Load tokens from MongoDB on startup
+async function loadTokens() {
   try {
-    // Exchange authorization code for access and refresh tokens
-    const tokenResponse = await axios.post(
-      "https://accounts.spotify.com/api/token",
-      querystring.stringify({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: REDIRECT_URI,
-      }),
-      {
-        headers: {
-          Authorization:
-            "Basic " +
-            Buffer.from(CLIENT_ID + ":" + CLIENT_SECRET).toString("base64"),
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
-    );
-
-    // Save tokens in memory and persist to MongoDB
-    accessToken = tokenResponse.data.access_token;
-    refreshToken = tokenResponse.data.refresh_token;
-    await saveTokens();
-
-    return res.send(`
-      <html>
-        <body>
-          <script>
-            (function() {
-              const returnTo = ${JSON.stringify(returnTo)};
-              if (window.opener) {
-                window.opener.postMessage({ type: "SPOTIFY_LOGIN_SUCCESS", returnTo }, "*");
-                window.close();
-              } else {
-                window.location.href = returnTo;
-              }
-            })();
-          </script>
-          <p>Login successful! You can close this window.</p>
-        </body>
-      </html>
-    `);
-  } catch (error) {
-    console.error("Callback error:", error.response?.data || error.message);
-    return res.status(500).send("Authentication failed");
+    const doc = await tokensCollection.findOne({ _id: "user_tokens" });
+    if (doc) {
+      accessToken = doc.accessToken || "";
+      refreshToken = doc.refreshToken || "";
+      log("Tokens loaded from MongoDB.");
+    } else {
+      log("No tokens found in DB.");
+    }
+  } catch (e) {
+    log("Error loading tokens:", e.message);
   }
-});
+}
 
-/**
- * Refresh Spotify access token using refresh token
- */
+// Refresh access token using refresh token
 async function refreshAccessToken() {
   if (!refreshToken) {
     log("No refresh token available.");
@@ -202,13 +98,11 @@ async function refreshAccessToken() {
     );
 
     accessToken = response.data.access_token;
-    // Spotify may not always return a new refresh token
     if (response.data.refresh_token) {
       refreshToken = response.data.refresh_token;
     }
-
     await saveTokens();
-    log("✅ Access token refreshed.");
+    log("Access token refreshed.");
     return true;
   } catch (error) {
     log(
@@ -219,81 +113,102 @@ async function refreshAccessToken() {
   }
 }
 
-/**
- * Helper to delay execution for ms milliseconds
- */
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// Spotify login redirect
+app.get("/login", (req, res) => {
+  const scope = "user-read-currently-playing user-read-playback-state";
+  const state = generateState();
 
-/**
- * Get currently playing track
- */
-app.get("/current", async (req, res) => {
-  if (!accessToken) {
-    return res.status(401).json({ error: "User not authenticated" });
+  const authQuery = querystring.stringify({
+    response_type: "code",
+    client_id: CLIENT_ID,
+    scope,
+    redirect_uri: REDIRECT_URI,
+    state,
+  });
+
+  const authUrl = `https://accounts.spotify.com/authorize?${authQuery}`;
+  log("Redirecting to Spotify login.");
+  res.redirect(authUrl);
+});
+
+// Spotify OAuth callback
+app.get("/callback", async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send("Missing code or state");
+
+  try {
+    const tokenRes = await axios.post(
+      "https://accounts.spotify.com/api/token",
+      querystring.stringify({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+      }),
+      {
+        headers: {
+          Authorization:
+            "Basic " +
+            Buffer.from(CLIENT_ID + ":" + CLIENT_SECRET).toString("base64"),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+      }
+    );
+
+    accessToken = tokenRes.data.access_token;
+    refreshToken = tokenRes.data.refresh_token;
+    await saveTokens();
+
+    res.send(
+      `<html><body><h2>Login successful!</h2><p>You can close this window now.</p></body></html>`
+    );
+  } catch (error) {
+    console.error("Callback error:", error.response?.data || error.message);
+    res.status(500).send("Authentication failed");
   }
+});
+
+// Get currently playing track
+app.get("/current", async (req, res) => {
+  if (!accessToken) return res.status(401).json({ error: "Not authenticated" });
 
   async function fetchCurrent() {
     try {
       const response = await axios.get(
         "https://api.spotify.com/v1/me/player/currently-playing",
         {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-          },
+          headers: { Authorization: `Bearer ${accessToken}` },
         }
       );
 
-      // Spotify returns 204 No Content if nothing is playing
       if (response.status === 204) {
         return res.json({
           playing: false,
           message: "No song currently playing",
         });
       }
-
-      return res.status(response.status).json(response.data);
+      return res.json(response.data);
     } catch (err) {
-      if (err.response) {
-        const status = err.response.status;
-
-        if (status === 401 && refreshToken) {
-          log("⚠️ Access token expired, refreshing...");
-          const refreshed = await refreshAccessToken();
-          if (refreshed) {
-            return fetchCurrent(); // retry once
-          }
-          return res
-            .status(401)
-            .json({ error: "Unauthorized, token refresh failed" });
-        }
-
-        if (status === 429) {
-          const retryAfter = parseInt(err.response.headers["retry-after"]) || 1;
-          log(`Rate limited. Retrying after ${retryAfter} seconds...`);
-          await delay(retryAfter * 1000);
-          return fetchCurrent(); // retry after delay
-        }
+      if (err.response?.status === 401 && refreshToken) {
+        log("Access token expired, refreshing...");
+        const refreshed = await refreshAccessToken();
+        if (refreshed) return fetchCurrent();
+        return res.status(401).json({ error: "Unauthorized, refresh failed" });
       }
-
       log("Error fetching current song:", err.response?.data || err.message);
-      return res.status(500).json({ error: "Failed to fetch current song" });
+      res.status(500).json({ error: "Failed to fetch current song" });
     }
   }
 
   return fetchCurrent();
 });
 
-/**
- * Start server after MongoDB connects and tokens are loaded
- */
+// Start server after MongoDB connection and loading tokens
 (async () => {
   try {
     await client.connect();
     tokensCollection = client.db("spotify").collection("tokens");
     await loadTokens();
-
+    log("Server starting on port", PORT);
     app.listen(PORT, () => {
       log(`Server running at http://localhost:${PORT}`);
       log(`Login endpoint: http://localhost:${PORT}/login`);
