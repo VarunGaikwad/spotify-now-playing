@@ -3,50 +3,32 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const querystring = require("querystring");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 
-// File where tokens are stored (add to .gitignore!)
-const TOKEN_FILE = path.join(__dirname, "tokens.json");
+// MongoDB setup
+const MONGODB_URI = `mongodb+srv://gaikwadvarun23:${
+  process.env.MONGODB_PASSWORD || ""
+}@spotify-cluster.ckcsftr.mongodb.net/?retryWrites=true&w=majority&appName=Spotify-Cluster`;
+if (!MONGODB_URI) {
+  console.error("Missing MONGODB_URI environment variable");
+  process.exit(1);
+}
 
-// In-memory token storage
+const client = new MongoClient(MONGODB_URI);
+let tokensCollection;
+
+// In-memory token cache (updated on load/save)
 let accessToken = "";
 let refreshToken = "";
 
 // In-memory state store for CSRF protection & redirect URLs
 const stateStore = new Map();
-
-// Load tokens from disk on startup
-function loadTokens() {
-  try {
-    const raw = fs.readFileSync(TOKEN_FILE, "utf-8");
-    const tokens = JSON.parse(raw);
-    accessToken = tokens.accessToken || "";
-    refreshToken = tokens.refreshToken || "";
-    log("Tokens loaded from file.");
-  } catch (e) {
-    log("No tokens file found, starting fresh.");
-  }
-}
-
-// Save tokens to disk
-function saveTokens() {
-  try {
-    fs.writeFileSync(
-      TOKEN_FILE,
-      JSON.stringify({ accessToken, refreshToken }, null, 2),
-      "utf-8"
-    );
-  } catch (e) {
-    log("Error saving tokens:", e.message);
-  }
-}
 
 // Simple logger with timestamps
 function log(...args) {
@@ -68,10 +50,42 @@ if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
   process.exit(1);
 }
 
-loadTokens();
+/**
+ * Load tokens from MongoDB
+ */
+async function loadTokens() {
+  try {
+    const doc = await tokensCollection.findOne({ _id: "user_tokens" });
+    if (doc) {
+      accessToken = doc.accessToken || "";
+      refreshToken = doc.refreshToken || "";
+      log("Tokens loaded from MongoDB.");
+    } else {
+      log("No tokens found in MongoDB, starting fresh.");
+    }
+  } catch (e) {
+    log("Error loading tokens from MongoDB:", e.message);
+  }
+}
 
 /**
- * Spotify Authorization URL
+ * Save tokens to MongoDB
+ */
+async function saveTokens() {
+  try {
+    await tokensCollection.updateOne(
+      { _id: "user_tokens" },
+      { $set: { accessToken, refreshToken } },
+      { upsert: true }
+    );
+    log("Tokens saved to MongoDB.");
+  } catch (e) {
+    log("Error saving tokens to MongoDB:", e.message);
+  }
+}
+
+/**
+ * Spotify Authorization URL endpoint
  */
 app.get("/login", (req, res) => {
   const scope = "user-read-currently-playing user-read-playback-state";
@@ -132,15 +146,11 @@ app.get("/callback", async (req, res) => {
       }
     );
 
-    // Save tokens in memory and persist to file
+    // Save tokens in memory and persist to MongoDB
     accessToken = tokenResponse.data.access_token;
     refreshToken = tokenResponse.data.refresh_token;
-    saveTokens();
+    await saveTokens();
 
-    // Send a small page that:
-    // - posts a message to the opener window notifying success
-    // - closes the popup window automatically
-    // - fallback redirects if opener doesn't exist
     return res.send(`
       <html>
         <body>
@@ -197,7 +207,7 @@ async function refreshAccessToken() {
       refreshToken = response.data.refresh_token;
     }
 
-    saveTokens();
+    await saveTokens();
     log("✅ Access token refreshed.");
     return true;
   } catch (error) {
@@ -275,8 +285,21 @@ app.get("/current", async (req, res) => {
   return fetchCurrent();
 });
 
-// Start the server
-app.listen(PORT, () => {
-  log(`Server running at http://localhost:${PORT}`);
-  log(`Login endpoint: http://localhost:${PORT}/login`);
-});
+/**
+ * Start server after MongoDB connects and tokens are loaded
+ */
+(async () => {
+  try {
+    await client.connect();
+    tokensCollection = client.db("spotify").collection("tokens");
+    await loadTokens();
+
+    app.listen(PORT, () => {
+      log(`Server running at http://localhost:${PORT}`);
+      log(`Login endpoint: http://localhost:${PORT}/login`);
+    });
+  } catch (e) {
+    console.error("Failed to start server:", e);
+    process.exit(1);
+  }
+})();
