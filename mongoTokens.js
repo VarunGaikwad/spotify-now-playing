@@ -1,6 +1,8 @@
+require("dotenv").config();
+
 const { MongoClient } = require("mongodb");
 
-const uri = `mongodb+srv://gaikwadvarun23:${MONGODB_PASSWORD}@spotify-cluster.ckcsftr.mongodb.net/?retryWrites=true&w=majority&appName=Spotify-Cluster`;
+const uri = `mongodb+srv://gaikwadvarun23:${process.env.MONGODB_PASSWORD}@spotify-cluster.ckcsftr.mongodb.net/?retryWrites=true&w=majority&appName=Spotify-Cluster`;
 const client = new MongoClient(uri);
 
 let accessToken = "";
