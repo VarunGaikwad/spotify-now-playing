@@ -10,8 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
+app.use(express.json());
 
-// Spotify and MongoDB config
 const { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, MONGODB_PASSWORD } =
   process.env;
 
@@ -30,20 +30,19 @@ const client = new MongoClient(MONGODB_URI, {
 });
 
 let tokensCollection;
+let nowPlayingCollection;
+
 let accessToken = "";
 let refreshToken = "";
 
-// Simple logger
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-// Generate random string for state param
 function generateState(length = 16) {
   return crypto.randomBytes(length).toString("hex");
 }
 
-// Save tokens to MongoDB
 async function saveTokens() {
   try {
     await tokensCollection.updateOne(
@@ -57,7 +56,6 @@ async function saveTokens() {
   }
 }
 
-// Load tokens from MongoDB on startup
 async function loadTokens() {
   try {
     const doc = await tokensCollection.findOne({ _id: "user_tokens" });
@@ -73,7 +71,6 @@ async function loadTokens() {
   }
 }
 
-// Refresh access token using refresh token
 async function refreshAccessToken() {
   if (!refreshToken) {
     log("No refresh token available.");
@@ -113,7 +110,6 @@ async function refreshAccessToken() {
   }
 }
 
-// Spotify login redirect
 app.get("/login", (req, res) => {
   const scope = "user-read-currently-playing user-read-playback-state";
   const state = generateState();
@@ -131,7 +127,6 @@ app.get("/login", (req, res) => {
   res.redirect(authUrl);
 });
 
-// Spotify OAuth callback
 app.get("/callback", async (req, res) => {
   const { code, state } = req.query;
   if (!code || !state) return res.status(400).send("Missing code or state");
@@ -167,7 +162,6 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-// Get currently playing track
 app.get("/current", async (req, res) => {
   if (!accessToken) return res.status(401).json({ error: "Not authenticated" });
 
@@ -202,16 +196,41 @@ app.get("/current", async (req, res) => {
   return fetchCurrent();
 });
 
-// Start server after MongoDB connection and loading tokens
+// New endpoint: Receive now playing data and save to MongoDB
+app.post("/update-now-playing", async (req, res) => {
+  const songData = req.body;
+
+  if (!songData || !songData.item) {
+    return res.status(400).json({ error: "Invalid data: missing 'item'" });
+  }
+
+  try {
+    await nowPlayingCollection.updateOne(
+      { _id: "current_song" },
+      { $set: songData },
+      { upsert: true }
+    );
+
+    return res.json({ status: "success", message: "Now playing updated" });
+  } catch (error) {
+    console.error("Failed to update now playing:", error);
+    return res.status(500).json({ error: "Database error" });
+  }
+});
+
 (async () => {
   try {
     await client.connect();
     tokensCollection = client.db("spotify").collection("tokens");
+    nowPlayingCollection = client.db("spotify").collection("now_playing");
     await loadTokens();
     log("Server starting on port", PORT);
     app.listen(PORT, () => {
       log(`Server running at http://localhost:${PORT}`);
       log(`Login endpoint: http://localhost:${PORT}/login`);
+      log(
+        `Now playing update endpoint: http://localhost:${PORT}/update-now-playing`
+      );
     });
   } catch (e) {
     console.error("Failed to start server:", e);
