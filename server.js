@@ -218,6 +218,20 @@ app.post("/update-now-playing", async (req, res) => {
   }
 });
 
+app.get("/youtube-now-playing", async (req, res) => {
+  try {
+    const doc = await nowPlayingCollection.findOne({ _id: "current_song" });
+    if (!doc || doc.platform !== "youtube") {
+      return res.status(404).json({ error: "No YouTube Music track found" });
+    }
+
+    return res.json(doc);
+  } catch (err) {
+    console.error("Failed to fetch YouTube Music now playing:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 (async () => {
   try {
     await client.connect();
